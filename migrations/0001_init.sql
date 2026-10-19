@@ -59,3 +59,28 @@ CREATE TABLE actions (
   result TEXT
 );
 CREATE INDEX actions_waiting ON actions (status, requested_at);
+
+CREATE TABLE escalations (
+  case_id TEXT PRIMARY KEY REFERENCES cases(id),
+  priority TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  queued_at INTEGER NOT NULL,
+  delivered_at INTEGER,
+  delivery TEXT
+);
+
+-- Traces: one per customer turn (or queue delivery), spans for every model
+-- call, tool call and guardrail check inside it.
+CREATE TABLE spans (
+  trace_id TEXT NOT NULL,
+  span_id TEXT NOT NULL,
+  parent_id TEXT,
+  case_id TEXT,
+  name TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('ok', 'error')),
+  attrs TEXT NOT NULL,
+  PRIMARY KEY (trace_id, span_id)
+);
+CREATE INDEX spans_by_case ON spans (case_id, started_at);
