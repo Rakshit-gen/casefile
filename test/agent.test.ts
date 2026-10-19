@@ -265,3 +265,36 @@ describe("handing off", () => {
     expect((await caseRow(r.caseId))!.agent_version).toBe("human");
   });
 });
+
+describe("http", () => {
+  const body = JSON.stringify({ caseId: "W-1", accountId: "acct-pebble", subject: "no https", description: "my site has no padlock" });
+  const signed = async (ts: number, b = body) => ({
+    "content-type": "application/json",
+    "x-casefile-timestamp": String(ts),
+    "x-casefile-signature": `sha256=${await sign("test-webhook-secret", `${ts}.${b}`)}`,
+  });
+
+  it("accepts only signed, fresh webhooks, and a retried webhook gets the same case", async () => {
+    install(steps([say("Your zone has SSL off. I can propose turning it on.")]));
+    const now = Math.floor(Date.now() / 1000);
+    expect((await SELF.fetch("http://x/api/webhooks/case", { method: "POST", body, headers: { ...(await signed(now)), "x-casefile-signature": "sha256=00" } })).status).toBe(401);
+    expect((await SELF.fetch("http://x/api/webhooks/case", { method: "POST", body, headers: await signed(now - 600) })).status).toBe(401);
+
+    const ok = await SELF.fetch("http://x/api/webhooks/case", { method: "POST", body, headers: await signed(now) });
+    expect(ok.status).toBe(201);
+    const first = await ok.json<{ caseId: string; customerToken: string; reply: string }>();
+    const retry = await (await SELF.fetch("http://x/api/webhooks/case", { method: "POST", body, headers: await signed(now) })).json<{ reply: string }>();
+    expect(retry.reply).toBe(first.reply);
+
+    // The customer can talk on their case with its token and nothing else.
+    const msg = (token: string) =>
+      SELF.fetch(`http://x/api/cases/${first.caseId}/messages`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ text: "thanks" }) });
+    expect((await msg("wrong")).status).toBe(401);
+    expect((await msg(first.customerToken)).status).toBe(200);
+  });
+
+  it("keeps the operator API behind the operator token", async () => {
+    expect((await SELF.fetch("http://x/api/cases")).status).toBe(401);
+    expect((await SELF.fetch("http://x/api/metrics", { headers: { authorization: "Bearer test-operator-token" } })).status).toBe(200);
+  });
+});
