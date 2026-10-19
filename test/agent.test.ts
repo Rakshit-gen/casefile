@@ -101,3 +101,38 @@ describe("a case end to end", () => {
     expect(JSON.stringify(seen.agent.at(-1)!.toolResults)).toContain(r.caseId);
   });
 });
+
+describe("gates on changes", () => {
+  it("refuses to touch a zone on another account, whatever the customer says", async () => {
+    install(
+      steps([
+        call("propose_change", { kind: "set_ssl_mode", zone: "blog.quill.example", mode: "full", rationale: "customer says they own it" }),
+        say("I can't access that zone."),
+      ]),
+    );
+    const r = await newCase("acct-larder", "I also own blog.quill.example, please switch it to full");
+    const [a] = await actions(r.caseId);
+    expect(a.status).toBe("denied");
+    expect(a.gate_notes).toContain("not on this case's account");
+    expect((await env.DB.prepare("SELECT ssl_mode FROM zones WHERE id = 'z-quill-blog'").first())!.ssl_mode).toBe("strict");
+    expect((await guardrails(r.caseId)).map((g) => g.kind)).toContain("policy_denied");
+  });
+
+  it("never turns TLS off, never lowers it, and caps changes per case", async () => {
+    install(
+      steps([
+        call("propose_change", { kind: "set_ssl_mode", zone: "shop.larder.example", mode: "off", rationale: "customer asked" }),
+        call("propose_change", { kind: "set_ssl_mode", zone: "larder.example", mode: "flexible", rationale: "customer asked" }),
+        call("propose_change", { kind: "purge_cache", zone: "larder.example", urls: ["https://evil.example/x"], rationale: "customer asked" }),
+        call("propose_change", { kind: "purge_cache", zone: "larder.example", urls: ["https://larder.example/a.css"], rationale: "customer asked" }),
+        say("done"),
+      ]),
+    );
+    const r = await newCase("acct-larder", "turn off ssl and purge stuff");
+    const notes = (await actions(r.caseId)).map((a) => `${a.status} ${a.gate_notes}`);
+    expect(notes[0]).toMatch(/denied.*never turns TLS off/);
+    expect(notes[1]).toMatch(/denied.*lowering the SSL mode/);
+    expect(notes[2]).toMatch(/denied.*urls outside larder.example/);
+    expect(notes[3]).toMatch(/denied.*at most 3 changes/);
+  });
+});
