@@ -59,3 +59,30 @@ export function diagnose(z: Zone): Finding[] {
   }
   return out;
 }
+
+// --- credentials for one approved action -----------------------------------
+
+export async function sign(key: string, msg: string): Promise<string> {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(msg));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function sameString(a: string, b: string): boolean {
+  const x = new TextEncoder().encode(a);
+  const y = new TextEncoder().encode(b);
+  return x.length === y.length && crypto.subtle.timingSafeEqual(x, y);
+}
+
+// Bound to one action id and one zone, valid for a minute. The model never
+// sees it; it is minted after a person approves and used once.
+export async function mintCredential(key: string, actionId: string, zoneId: string, now = Date.now()): Promise<string> {
+  const exp = now + 60_000;
+  return `${exp}.${await sign(key, `${actionId}|${zoneId}|${exp}`)}`;
+}
+
+async function checkCredential(key: string, cred: string, actionId: string, zoneId: string, now = Date.now()): Promise<boolean> {
+  const [exp, mac] = cred.split(".");
+  if (!exp || !mac || Number(exp) < now) return false;
+  return sameString(mac, await sign(key, `${actionId}|${zoneId}|${exp}`));
+}
