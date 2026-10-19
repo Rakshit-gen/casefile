@@ -197,4 +197,24 @@ describe("guardrails", () => {
     const results = JSON.stringify(seen.agent.at(-1)!.toolResults);
     expect(results).toContain("<untrusted source=\\\"kb:kb-community-tls-tip\\\">");
   });
+
+  it("redacts PII and secrets before anything stores or sees them, and tells the customer to rotate", async () => {
+    const seen = install(steps([say("Thanks, looking into it.")]));
+    const r = await newCase(
+      "acct-larder",
+      "I'm jo@larder.example, card 4242 4242 4242 4242, call +44 20 7946 0958. my key is AKIAABCDEFGHIJKLMNOP",
+    );
+    const raw = ["jo@larder.example", "4242 4242 4242 4242", "7946 0958", "AKIAABCDEFGHIJKLMNOP"];
+    for (const s of raw) expect(seen.agent[0].promptText).not.toContain(s);
+    const transcript = await env.CASE.getByName(r.caseId).transcript();
+    for (const s of raw) expect(JSON.stringify(transcript)).not.toContain(s);
+    expect(r.reply).toMatch(/rotate it/);
+    expect((await guardrails(r.caseId)).map((g) => g.kind).sort()).toEqual(["pii_redacted", "pii_redacted", "pii_redacted", "secret_redacted"]);
+  });
+
+  it("redacts what the model says too", async () => {
+    install(steps([say("Sure, I emailed ops@larder.example the details.")]));
+    const r = await newCase("acct-larder", "hello");
+    expect(r.reply).toBe("Sure, I emailed [redacted email] the details.");
+  });
 });
