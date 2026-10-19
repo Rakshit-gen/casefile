@@ -86,3 +86,32 @@ async function checkCredential(key: string, cred: string, actionId: string, zone
   if (!exp || !mac || Number(exp) < now) return false;
   return sameString(mac, await sign(key, `${actionId}|${zoneId}|${exp}`));
 }
+
+export interface ActionRow {
+  id: string;
+  case_id: string;
+  kind: "purge_cache" | "set_ssl_mode";
+  zone_id: string;
+  params: string;
+}
+
+// The "zone API". Refuses anything without a valid credential for exactly
+// this action and zone.
+export async function execute(db: D1Database, key: string, action: ActionRow, credential: string): Promise<string> {
+  if (!(await checkCredential(key, credential, action.id, action.zone_id))) throw new Error("credential rejected");
+  const p = JSON.parse(action.params) as { mode?: SslMode; urls?: string[]; everything?: boolean };
+  if (action.kind === "set_ssl_mode") {
+    const r = await db
+      .prepare("UPDATE zones SET ssl_mode = ? WHERE id = ? RETURNING name, ssl_mode")
+      .bind(p.mode, action.zone_id)
+      .first<{ name: string; ssl_mode: string }>();
+    if (!r) throw new Error("zone not found");
+    return `SSL mode for ${r.name} is now ${r.ssl_mode}`;
+  }
+  const r = await db
+    .prepare("UPDATE zones SET cache_purged_at = ? WHERE id = ? RETURNING name")
+    .bind(Date.now(), action.zone_id)
+    .first<{ name: string }>();
+  if (!r) throw new Error("zone not found");
+  return p.everything ? `purged everything cached for ${r.name}` : `purged ${p.urls?.length ?? 0} URLs on ${r.name}`;
+}
