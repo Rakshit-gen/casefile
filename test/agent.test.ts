@@ -135,4 +135,40 @@ describe("gates on changes", () => {
     expect(notes[2]).toMatch(/denied.*urls outside larder.example/);
     expect(notes[3]).toMatch(/denied.*at most 3 changes/);
   });
+
+  it("stops a change the reviewer rejects, and treats a broken reviewer as a no", async () => {
+    install(steps(FIX_REDIRECT_LOOP), () => ({ text: '{"approve": false, "reason": "no finding supports it"}' }));
+    const r1 = await newCase("acct-larder", "redirect loop");
+    expect((await actions(r1.caseId))[0].status).toBe("rejected_by_reviewer");
+
+    install(steps(FIX_REDIRECT_LOOP), () => ({ text: "sure, looks fine to me" }));
+    const r2 = await newCase("acct-larder", "redirect loop");
+    const [a] = await actions(r2.caseId);
+    expect(a.status).toBe("rejected_by_reviewer");
+    expect(a.gate_notes).toContain("reviewer failed");
+    expect((await zone("z-larder-shop"))!.ssl_mode).toBe("flexible");
+  });
+
+  it("runs low-risk purges without a person only when the flag says so", async () => {
+    const purge = [
+      call("propose_change", { kind: "purge_cache", zone: "larder.example", urls: ["https://larder.example/app.js"], rationale: "stale asset after deploy" }),
+      call("propose_change", { kind: "purge_cache", zone: "larder.example", everything: true, rationale: "stale assets after deploy" }),
+      say("Purged."),
+    ];
+    await env.FLAGS.put(FLAGS_KEY, JSON.stringify({ autoApproveLowRisk: true }));
+    install(steps(purge));
+    const r = await newCase("acct-larder", "old app.js after deploy, please purge");
+    expect((await actions(r.caseId)).map((a) => a.status)).toEqual(["executed", "awaiting_human"]);
+  });
+
+  it("expires a change nobody approves and hands the case to a person", async () => {
+    install(steps(FIX_REDIRECT_LOOP));
+    const r = await newCase("acct-larder", "redirect loop");
+    const [a] = await actions(r.caseId);
+    const stub = env.CASE.getByName(r.caseId);
+    await runInDurableObject(stub, (inst: SupportAgent) => inst.approvalTimeout({ actionId: a.id }));
+    expect((await actions(r.caseId))[0].status).toBe("expired");
+    expect((await caseRow(r.caseId))!.status).toBe("escalated");
+    expect((await env.DB.prepare("SELECT priority FROM escalations WHERE case_id = ?").bind(r.caseId).first())!.priority).toBe("urgent");
+  });
 });
