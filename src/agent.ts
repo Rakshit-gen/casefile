@@ -154,4 +154,125 @@ export class SupportAgent extends Agent<Env, CaseState> {
       return this.turn(text, await readFlags(this.env.FLAGS));
     });
   }
+
+  private async turn(text: string, flags: AgentFlags): Promise<TurnResult> {
+    const env = this.env;
+    const caseId = this.state.caseId;
+    const trace = new Trace(caseId, "turn");
+
+    const input = await trace.span("guard.input", {}, async () => {
+      const r = redact(text);
+      return { ...r, injection: injectionSignals(r.text) };
+    });
+    for (const f of input.findings) await this.guardrail(trace, f.kind === "secret" ? "secret_redacted" : "pii_redacted", f.label);
+    if (input.injection.length) await this.guardrail(trace, "injection_in_message", input.injection.join(", "));
+    this.say("customer", input.text, trace.traceId);
+
+    // Once a person owns the case the agent stops talking.
+    if (this.state.status === "escalated" || this.state.status === "human_only") {
+      await trace.end(env.DB, { case: caseId, skipped: this.state.status });
+      return { caseId, status: this.state.status, reply: null, traceId: trace.traceId };
+    }
+
+    const outcome: Outcome = { escalate: null, resolve: null, awaiting: [], executed: [] };
+    const tools = caseTools({
+      env,
+      caseId,
+      accountId: this.state.accountId,
+      flags,
+      recall: recallFor(env),
+      trace,
+      customerMessages: this.customerMessages(),
+      outcome,
+      guardrail: (kind, detail) => this.guardrail(trace, kind, detail),
+    });
+
+    let reply: string;
+    let usage = { inputTokens: 0, outputTokens: 0 };
+    let stepStart = Date.now();
+    try {
+      const r = await generateText({
+        model: model(env, flags.model, caseId),
+        system: PROMPTS[flags.promptVersion]({ caseId, subject: this.state.subject, accountId: this.state.accountId, plan: this.state.plan, notes: this.notes() }),
+        messages: this.history(),
+        tools,
+        stopWhen: stepCountIs(flags.maxSteps),
+        maxRetries: 2,
+        onStepStart: () => {
+          stepStart = Date.now();
+        },
+        onStepFinish: (step) => {
+          trace.record(
+            "agent.step",
+            {
+              model: flags.model,
+              input_tokens: step.usage.inputTokens ?? 0,
+              output_tokens: step.usage.outputTokens ?? 0,
+              finish: step.finishReason,
+              tool_calls: step.toolCalls.map((c) => c.toolName).join(","),
+            },
+            stepStart,
+            Date.now() - stepStart,
+          );
+        },
+      });
+      usage = { inputTokens: r.totalUsage.inputTokens ?? 0, outputTokens: r.totalUsage.outputTokens ?? 0 };
+      reply = r.text.trim();
+    } catch (e) {
+      // A broken model is an escalation, not a dead chat.
+      const msg = e instanceof Error ? e.message : String(e);
+      trace.record("agent.error", { error: msg.slice(0, 300) }, stepStart, Date.now() - stepStart, "error");
+      outcome.escalate ??= { reason: "the agent failed to answer", summary: `Model error: ${msg.slice(0, 200)}`, nextStep: "answer the customer", priority: "normal" };
+      reply = "";
+    }
+
+    if (!reply) {
+      reply = outcome.escalate
+        ? HANDOFF
+        : outcome.awaiting.length
+          ? "I've proposed a fix. A support engineer has to approve it before it runs, and I'll update you here when it has."
+          : "I couldn't finish working this out, so I've passed it to a support engineer.";
+      if (!outcome.escalate && !outcome.awaiting.length) {
+        outcome.escalate = { reason: "the agent ran out of steps", summary: this.state.subject, nextStep: "review the trace", priority: "normal" };
+      }
+    }
+
+    const out = await trace.span("guard.output", {}, async () => redact(reply));
+    for (const f of out.findings) await this.guardrail(trace, "output_redacted", f.label);
+    reply = out.text;
+    if (input.findings.some((f) => f.kind === "secret")) {
+      reply += "\n\nYour message included what looks like a credential. I removed it from the case, but treat it as exposed and rotate it.";
+    }
+    this.say("agent", reply, trace.traceId);
+
+    await env.DB.batch([
+      env.DB.prepare("UPDATE cases SET first_response_at = coalesce(first_response_at, ?) WHERE id = ?").bind(Date.now(), caseId),
+      env.DB.prepare("INSERT OR REPLACE INTO usage VALUES (?, ?, ?, 'agent', ?, ?, ?, ?)").bind(
+        caseId, trace.traceId, flags.model, usage.inputTokens, usage.outputTokens, cost(flags.model, usage), Date.now(),
+      ),
+    ]);
+
+    if (outcome.escalate) {
+      await this.escalate(trace, outcome.escalate);
+    } else if (outcome.resolve) {
+      const summary = redact(outcome.resolve.summary).text;
+      await this.setStatus("resolved", { summary });
+      await recallFor(env).index("cases", [{ id: caseId, title: this.state.subject, text: summary }]);
+    } else if (outcome.awaiting.length) {
+      for (const id of outcome.awaiting) {
+        this.say("note", `Change ${id} is waiting for a support engineer to approve it.`, trace.traceId);
+        await this.schedule(Number(env.APPROVAL_SLA_SECONDS) || 1800, "approvalTimeout", { actionId: id });
+      }
+      await this.setStatus("waiting_on_approval");
+    }
+
+    await trace.end(env.DB, {
+      case: caseId,
+      status: this.state.status,
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      prompt: flags.promptVersion,
+    });
+    return { caseId, status: this.state.status, reply, traceId: trace.traceId };
+  }
 }
