@@ -1,0 +1,6 @@
+# Copy to .dev.vars for wrangler dev. Use long random values; `openssl rand -hex 32` works.
+WEBHOOK_SECRET=
+OPERATOR_TOKEN=
+ACTION_SIGNING_KEY=
+# Optional: where escalations are POSTed (signed, with a traceparent header).
+# ESCALATION_WEBHOOK_URL=

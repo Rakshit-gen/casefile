@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "casefile",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "./public" },
+  "durable_objects": {
+    "bindings": [{ "name": "CASE", "class_name": "SupportAgent" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SupportAgent"] }],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "casefile", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }
+  ],
+  "kv_namespaces": [{ "binding": "FLAGS", "id": "00000000000000000000000000000000" }],
+  "vectorize": [{ "binding": "VECTORS", "index_name": "casefile-kb", "remote": true }],
+  "ai": { "binding": "AI", "remote": true },
+  "queues": {
+    "producers": [{ "binding": "ESCALATIONS", "queue": "casefile-escalations" }],
+    "consumers": [{ "queue": "casefile-escalations", "max_batch_size": 10, "max_retries": 5 }]
+  },
+  "vars": {
+    "AI_GATEWAY_ID": "casefile",
+    "APPROVAL_SLA_SECONDS": "1800"
+  },
+  // Secrets: WEBHOOK_SECRET (signs incoming case webhooks), OPERATOR_TOKEN
+  // (console and operator API), ACTION_SIGNING_KEY (mints the short-lived
+  // credential an approved action runs with). Optional: ESCALATION_WEBHOOK_URL.
+  "observability": { "enabled": true }
+}
