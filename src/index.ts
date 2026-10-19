@@ -74,3 +74,61 @@ export async function openCase(env: Env, input: z.infer<typeof CaseWebhook>) {
   const r = await (await agent(env, caseId)).open({ ...input, caseId });
   return { ...r, customerToken: await customerToken(env, caseId) };
 }
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    try {
+      if (req.method === "POST" && path === "/api/webhooks/case") {
+        const raw = await req.text();
+        await verifyWebhook(req, env, raw);
+        return json(await openCase(env, await parse(req, CaseWebhook, raw)), 201);
+      }
+
+      let m = path.match(/^\/api\/cases\/([\w-]+)\/(messages|transcript)$/);
+      if (m) {
+        await requireCustomer(req, env, m[1]);
+        const stub = await agent(env, m[1]);
+        if (req.method === "POST" && m[2] === "messages") return json(await stub.message((await parse(req, Message)).text));
+        if (req.method === "GET" && m[2] === "transcript") return json((await stub.transcript()).filter((t) => t.role !== "note"));
+      }
+
+      if (!path.startsWith("/api/")) return new Response("not found", { status: 404 });
+      await requireOperator(req, env);
+
+      if (req.method === "POST" && path === "/api/seed") return json(await seed(env));
+      // Opens a case without the webhook secret, for the console's demo button.
+      if (req.method === "POST" && path === "/api/demo/case") return json(await openCase(env, await parse(req, CaseWebhook)), 201);
+      if (req.method === "GET" && path === "/api/cases") return json(await listCases(env));
+      if (req.method === "GET" && path === "/api/metrics") return json(await metrics(env));
+      if (req.method === "GET" && path === "/api/flags") return json(await readFlags(env.FLAGS));
+      if (req.method === "PUT" && path === "/api/flags") {
+        const f = await parse(req, AgentFlags.partial());
+        const next = { ...(await readFlags(env.FLAGS)), ...f };
+        await env.FLAGS.put(FLAGS_KEY, JSON.stringify(next));
+        return json(next);
+      }
+
+      m = path.match(/^\/api\/cases\/([\w-]+)$/);
+      if (req.method === "GET" && m) return json(await caseDetail(env, m[1]));
+
+      m = path.match(/^\/api\/actions\/([\w-]+)\/decision$/);
+      if (req.method === "POST" && m) {
+        const d = await parse(req, Decision);
+        const a = await env.DB.prepare("SELECT case_id FROM actions WHERE id = ?").bind(m[1]).first<{ case_id: string }>();
+        if (!a) throw new HttpError(404, `no action ${m[1]}`);
+        return json(await (await agent(env, a.case_id)).decide(m[1], d.approved, d.by));
+      }
+
+      return bad("not found", 404);
+    } catch (e) {
+      if (e instanceof HttpError) return bad(e.message, e.status);
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/^no (account|action|such case)/.test(msg)) return bad(msg, 404);
+      if (/ is already /.test(msg)) return bad(msg, 409);
+      console.error(JSON.stringify({ level: "error", name: "http.error", path, error: msg }));
+      return bad("internal error", 500);
+    }
+  },
+};
