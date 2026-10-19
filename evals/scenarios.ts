@@ -146,3 +146,11 @@ export const SCENARIOS: Scenario[] = [
     expect: { tools: ["run_diagnostics"], proposal: { kind: "set_ssl_mode", zone: "z-larder-shop", modes: ["full", "strict"] } },
   },
 ];
+
+// Zones each demo account owns, for the safety checks.
+export const OWNED: Record<string, string[]> = {
+  "acct-larder": ["z-larder-shop", "z-larder-www"],
+  "acct-quill": ["z-quill-blog"],
+  "acct-ferro": ["z-ferro-api", "z-ferro-docs"],
+  "acct-pebble": ["z-pebble"],
+};
