@@ -215,3 +215,36 @@ function pct(values: number[], p: number): number | null {
   const s = [...values].sort((a, b) => a - b);
   return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
 }
+
+async function metrics(env: Env) {
+  const since = Date.now() - 7 * 86_400_000;
+  const [cases, ttfr, cost, actions, guards, steps, tools] = await env.DB.batch([
+    env.DB.prepare("SELECT status, count(*) AS n FROM cases WHERE opened_at > ? GROUP BY status").bind(since),
+    env.DB.prepare("SELECT first_response_at - opened_at AS ms FROM cases WHERE opened_at > ? AND first_response_at IS NOT NULL AND agent_version != 'human'").bind(since),
+    env.DB.prepare(
+      "SELECT count(DISTINCT u.case_id) AS cases, coalesce(sum(u.cost_usd), 0) AS usd, coalesce(sum(u.input_tokens), 0) AS input, coalesce(sum(u.output_tokens), 0) AS output FROM usage u WHERE u.at > ?",
+    ).bind(since),
+    env.DB.prepare("SELECT status, count(*) AS n FROM actions WHERE requested_at > ? GROUP BY status").bind(since),
+    env.DB.prepare("SELECT kind, count(*) AS n FROM guardrail_events WHERE at > ? GROUP BY kind").bind(since),
+    env.DB.prepare("SELECT duration_ms AS ms FROM spans WHERE name = 'agent.step' AND started_at > ? ORDER BY started_at DESC LIMIT 2000").bind(since),
+    env.DB.prepare("SELECT name, count(*) AS n, sum(status = 'error') AS errors, avg(duration_ms) AS avg_ms FROM spans WHERE name LIKE 'tool.%' AND started_at > ? GROUP BY name").bind(since),
+  ]);
+  const byStatus = Object.fromEntries((cases.results as { status: string; n: number }[]).map((r) => [r.status, r.n]));
+  const total = Object.values(byStatus).reduce((a: number, b) => a + (b as number), 0);
+  const firsts = (ttfr.results as { ms: number }[]).map((r) => r.ms);
+  const stepMs = (steps.results as { ms: number }[]).map((r) => r.ms);
+  const c = cost.results[0] as { cases: number; usd: number; input: number; output: number };
+  return {
+    window: "7d",
+    cases: { total, byStatus },
+    resolvedByAgent: total ? (byStatus.resolved ?? 0) / total : null,
+    escalationRate: total ? ((byStatus.escalated ?? 0) + (byStatus.human_only ?? 0)) / total : null,
+    firstResponseMs: { p50: pct(firsts, 50), p95: pct(firsts, 95), n: firsts.length },
+    stepLatencyMs: { p50: pct(stepMs, 50), p95: pct(stepMs, 95), n: stepMs.length },
+    costPerCaseUsd: c.cases ? c.usd / c.cases : null,
+    tokens: { input: c.input, output: c.output },
+    actions: Object.fromEntries((actions.results as { status: string; n: number }[]).map((r) => [r.status, r.n])),
+    guardrails: Object.fromEntries((guards.results as { kind: string; n: number }[]).map((r) => [r.kind, r.n])),
+    tools: tools.results,
+  };
+}
