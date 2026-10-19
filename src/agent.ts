@@ -325,4 +325,19 @@ export class SupportAgent extends Agent<Env, CaseState> {
       return { status, result };
     });
   }
+
+  // Scheduled when a change is proposed. Nobody deciding in time is a no,
+  // and the case goes to a person.
+  async approvalTimeout(payload: { actionId: string }) {
+    return this.serial(async () => {
+      const r = await this.env.DB.prepare("UPDATE actions SET status = 'expired', decided_at = ? WHERE id = ? AND status = 'awaiting_human' RETURNING id")
+        .bind(Date.now(), payload.actionId)
+        .first();
+      if (!r) return;
+      const trace = new Trace(this.state.caseId, "approval.timeout");
+      this.say("agent", HANDOFF, trace.traceId);
+      await this.escalate(trace, { reason: `change ${payload.actionId} was not approved in time`, summary: this.state.subject, nextStep: "review the proposed change", priority: "urgent" });
+      await trace.end(this.env.DB, { action: payload.actionId });
+    });
+  }
 }
