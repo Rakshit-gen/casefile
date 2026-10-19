@@ -131,4 +131,41 @@ export default {
       return bad("internal error", 500);
     }
   },
-};
+
+  // Escalations leave the agent through a queue, so a slow or failing
+  // ticketing webhook never holds up a customer's reply. The message
+  // carries the trace id of the turn that escalated.
+  async queue(batch: MessageBatch<EscalationMessage>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      const m = msg.body;
+      const trace = new Trace(m.caseId, "escalation.deliver", m.traceparent);
+      try {
+        let delivery = "stored for the console";
+        if (env.ESCALATION_WEBHOOK_URL) {
+          const body = JSON.stringify({ caseId: m.caseId, priority: m.priority, summary: m.summary });
+          const ts = Math.floor(Date.now() / 1000);
+          const res = await trace.span("webhook.post", { attempt: msg.attempts }, async () =>
+            fetch(env.ESCALATION_WEBHOOK_URL!, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-casefile-timestamp": String(ts),
+                "x-casefile-signature": `sha256=${await sign(env.WEBHOOK_SECRET, `${ts}.${body}`)}`,
+                traceparent: trace.traceparent(),
+              },
+              body,
+            }),
+          );
+          if (!res.ok) throw new Error(`webhook answered ${res.status}`);
+          delivery = `webhook ${res.status}`;
+        }
+        await env.DB.prepare("UPDATE escalations SET delivered_at = ?, delivery = ? WHERE case_id = ?").bind(Date.now(), delivery, m.caseId).run();
+        await trace.end(env.DB, { attempts: msg.attempts, delivery });
+        msg.ack();
+      } catch (e) {
+        await trace.end(env.DB, { attempts: msg.attempts, error: e instanceof Error ? e.message : String(e) }, "error");
+        msg.retry({ delaySeconds: Math.min(300, 2 ** msg.attempts * 5) });
+      }
+    }
+  },
+} satisfies ExportedHandler<Env, EscalationMessage>;
