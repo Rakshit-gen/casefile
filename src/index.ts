@@ -169,3 +169,49 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env, EscalationMessage>;
+
+async function seed(env: Env) {
+  await env.DB.batch(seedStatements(env.DB));
+  const indexed = await recallFor(env).index(
+    "kb",
+    ARTICLES.map((a) => ({ id: a.id, title: a.title, text: a.body })),
+  );
+  if ((await env.FLAGS.get(FLAGS_KEY)) === null) await env.FLAGS.put(FLAGS_KEY, JSON.stringify(DEFAULT_FLAGS));
+  return { articles: indexed };
+}
+
+async function listCases(env: Env) {
+  const r = await env.DB.prepare(
+    `SELECT c.*, a.name AS account_name,
+       (SELECT count(*) FROM actions x WHERE x.case_id = c.id AND x.status = 'awaiting_human') AS awaiting
+     FROM cases c JOIN accounts a ON a.id = c.account_id ORDER BY c.opened_at DESC LIMIT 100`,
+  ).all();
+  return r.results;
+}
+
+export async function caseDetail(env: Env, id: string) {
+  const c = await env.DB.prepare("SELECT c.*, a.name AS account_name, a.plan FROM cases c JOIN accounts a ON a.id = c.account_id WHERE c.id = ?").bind(id).first();
+  if (!c) throw new HttpError(404, `no case ${id}`);
+  const [actions, spans, guardrails, usage, escalation] = await env.DB.batch([
+    env.DB.prepare("SELECT * FROM actions WHERE case_id = ? ORDER BY requested_at").bind(id),
+    env.DB.prepare("SELECT * FROM spans WHERE case_id = ? ORDER BY started_at, duration_ms DESC LIMIT 400").bind(id),
+    env.DB.prepare("SELECT * FROM guardrail_events WHERE case_id = ? ORDER BY at").bind(id),
+    env.DB.prepare("SELECT * FROM usage WHERE case_id = ? ORDER BY at").bind(id),
+    env.DB.prepare("SELECT * FROM escalations WHERE case_id = ?").bind(id),
+  ]);
+  return {
+    case: c,
+    transcript: await (await agent(env, id)).transcript(),
+    actions: (actions.results as Record<string, unknown>[]).map((a) => ({ ...a, gate_notes: JSON.parse(String(a.gate_notes)) })),
+    spans: (spans.results as Record<string, unknown>[]).map((s) => ({ ...s, attrs: JSON.parse(String(s.attrs)) })),
+    guardrails: guardrails.results,
+    usage: usage.results,
+    escalation: escalation.results[0] ?? null,
+  };
+}
+
+function pct(values: number[], p: number): number | null {
+  if (!values.length) return null;
+  const s = [...values].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
+}
