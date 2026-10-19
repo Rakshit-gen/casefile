@@ -114,4 +114,44 @@ export class SupportAgent extends Agent<Env, CaseState> {
     this.say("note", `Escalated to a person (${e.priority}): ${e.reason}`, trace.traceId);
     await this.setStatus(status);
   }
+
+  // Called once per case by the webhook. A retried webhook gets the same
+  // case back instead of a second one.
+  open(init: CaseInit): Promise<TurnResult> {
+    return this.serial(async () => {
+      if (this.state.caseId) {
+        const last = this.sql<{ content: string }>`SELECT content FROM messages WHERE role = 'agent' ORDER BY id DESC LIMIT 1`[0];
+        return { caseId: this.state.caseId, status: this.state.status, reply: last?.content ?? null, traceId: "" };
+      }
+      const acct = await this.env.DB.prepare("SELECT plan FROM accounts WHERE id = ?").bind(init.accountId).first<{ plan: string }>();
+      if (!acct) throw new Error(`no account ${init.accountId}`);
+      const flags = await readFlags(this.env.FLAGS);
+      const subject = redact(init.subject).text.slice(0, 200);
+      const live = inRollout(flags, init.accountId);
+      const agentVersion = live ? `${flags.model}#${flags.promptVersion}` : "human";
+      this.setState({ caseId: init.caseId, accountId: init.accountId, plan: acct.plan, subject, status: "open", agentVersion });
+      await this.env.DB.prepare("INSERT OR IGNORE INTO cases (id, account_id, subject, channel, status, agent_version, opened_at) VALUES (?, ?, ?, ?, 'open', ?, ?)")
+        .bind(init.caseId, init.accountId, subject, init.channel, agentVersion, Date.now())
+        .run();
+
+      if (!live) {
+        // The kill switch, or an account outside the rollout: straight to a person.
+        const trace = new Trace(init.caseId, "case.human_only");
+        this.say("customer", redact(init.description).text, trace.traceId);
+        await this.escalate(trace, { reason: "agent is off for this account", summary: subject, nextStep: "handle as a normal case", priority: "normal" }, "human_only");
+        this.say("agent", "Thanks, a support engineer will pick this up and reply here.", trace.traceId);
+        await this.env.DB.prepare("UPDATE cases SET first_response_at = ? WHERE id = ?").bind(Date.now(), init.caseId).run();
+        await trace.end(this.env.DB, { case: init.caseId, flags: "off" });
+        return { caseId: init.caseId, status: "human_only", reply: "Thanks, a support engineer will pick this up and reply here.", traceId: trace.traceId };
+      }
+      return this.turn(init.description, flags);
+    });
+  }
+
+  message(text: string): Promise<TurnResult> {
+    return this.serial(async () => {
+      if (!this.state.caseId) throw new Error("no such case");
+      return this.turn(text, await readFlags(this.env.FLAGS));
+    });
+  }
 }
