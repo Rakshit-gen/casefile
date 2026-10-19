@@ -86,3 +86,22 @@ describe("credentials", () => {
     await env.DB.prepare("UPDATE zones SET ssl_mode = 'off' WHERE id = 'z-pebble'").run();
   });
 });
+
+describe("policy", () => {
+  const z: Zone = {
+    id: "z", account_id: "a", name: "site.example", ssl_mode: "full", origin_https_only: 1, origin_cert_valid: 0, origin_up: 1, error_rate_5xx: 0, cache_purged_at: null,
+  };
+  const ctx = { accountId: "a", actionsSoFar: 0 };
+
+  it("needs a valid origin certificate for strict", () => {
+    expect(check("set_ssl_mode", { mode: "strict" }, z, ctx).reasons.at(-1)).toMatch(/valid origin certificate/);
+    expect(check("set_ssl_mode", { mode: "strict" }, { ...z, origin_cert_valid: 1 }, ctx)).toMatchObject({ allowed: true, risk: "high" });
+  });
+
+  it("accepts subdomain URLs, treats purge-everything as high risk, and rejects junk parameters", () => {
+    expect(check("purge_cache", { urls: ["https://cdn.site.example/a.js"] }, z, ctx)).toMatchObject({ allowed: true, risk: "low" });
+    expect(check("purge_cache", { urls: ["https://site.example.evil.example/a.js"] }, z, ctx).allowed).toBe(false);
+    expect(check("purge_cache", { everything: true }, z, ctx)).toMatchObject({ allowed: true, risk: "high" });
+    expect(check("set_ssl_mode", { mode: "maximum" }, z, ctx).reasons.at(-1)).toMatch(/bad parameters/);
+  });
+});
