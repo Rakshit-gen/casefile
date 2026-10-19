@@ -275,4 +275,54 @@ export class SupportAgent extends Agent<Env, CaseState> {
     });
     return { caseId, status: this.state.status, reply, traceId: trace.traceId };
   }
+
+  // The last gate: a person approves or rejects a proposed change. Only an
+  // approval mints the one-minute credential the change runs with.
+  decide(actionId: string, approved: boolean, by: string): Promise<{ status: string; result: string | null }> {
+    return this.serial(async () => {
+      const env = this.env;
+      const a = await env.DB.prepare("SELECT a.*, z.name AS zone_name FROM actions a LEFT JOIN zones z ON z.id = a.zone_id WHERE a.id = ? AND a.case_id = ?")
+        .bind(actionId, this.state.caseId)
+        .first<ActionRow & { status: string; zone_name: string }>();
+      if (!a) throw new Error(`no action ${actionId}`);
+      if (a.status !== "awaiting_human") throw new Error(`action ${actionId} is already ${a.status}`);
+
+      const trace = new Trace(this.state.caseId, "decision");
+      let status = approved ? "executed" : "rejected";
+      let result: string | null = null;
+      if (approved) {
+        try {
+          result = await trace.span("action.execute", { action: a.id, kind: a.kind }, async () =>
+            execute(env.DB, env.ACTION_SIGNING_KEY, a, await mintCredential(env.ACTION_SIGNING_KEY, a.id, a.zone_id)),
+          );
+        } catch (e) {
+          status = "failed";
+          result = e instanceof Error ? e.message : String(e);
+        }
+      }
+      await env.DB.prepare("UPDATE actions SET status = ?, decided_by = ?, decided_at = ?, result = ? WHERE id = ?")
+        .bind(status, by, Date.now(), result, a.id)
+        .run();
+
+      if (status === "executed") {
+        this.say("note", `Change ${a.id} was approved by ${by} and ran: ${result}.`, trace.traceId);
+        this.say("agent", `Update: the change I proposed has been approved and applied (${result}). Give it a minute, then check the site again and tell me if it's still broken.`, trace.traceId);
+      } else {
+        this.say("note", `Change ${a.id} was ${status === "failed" ? `approved but failed: ${result}` : `rejected by ${by}`}.`, trace.traceId);
+        this.say("agent", HANDOFF, trace.traceId);
+        await this.escalate(trace, {
+          reason: status === "failed" ? `approved change ${a.id} failed` : `${by} rejected change ${a.id}`,
+          summary: `${a.kind} on ${a.zone_name ?? a.zone_id} ${a.params}`,
+          nextStep: "decide the fix with the customer",
+          priority: "normal",
+        });
+      }
+      if (this.state.status === "waiting_on_approval") {
+        const left = await env.DB.prepare("SELECT count(*) AS n FROM actions WHERE case_id = ? AND status = 'awaiting_human'").bind(this.state.caseId).first<{ n: number }>();
+        if (!left?.n) await this.setStatus("open");
+      }
+      await trace.end(env.DB, { action: a.id, status, by });
+      return { status, result };
+    });
+  }
 }
