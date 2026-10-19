@@ -72,3 +72,17 @@ describe("flags", () => {
     expect(inRollout({ ...f, enabled: false }, "acct-1")).toBe(false);
   });
 });
+
+describe("credentials", () => {
+  const action = { id: "A-1", case_id: "C-1", kind: "set_ssl_mode" as const, zone_id: "z-pebble", params: '{"mode":"full"}' };
+
+  it("work once for the action they were minted for and nothing else", async () => {
+    const good = await mintCredential("k", "A-1", "z-pebble");
+    await expect(execute(env.DB, "k", { ...action, zone_id: "z-larder-shop" }, good)).rejects.toThrow("credential rejected");
+    await expect(execute(env.DB, "k", { ...action, id: "A-2" }, good)).rejects.toThrow("credential rejected");
+    await expect(execute(env.DB, "other-key", action, good)).rejects.toThrow("credential rejected");
+    await expect(execute(env.DB, "k", action, await mintCredential("k", "A-1", "z-pebble", Date.now() - 120_000))).rejects.toThrow("credential rejected");
+    expect(await execute(env.DB, "k", action, good)).toBe("SSL mode for pebble.example is now full");
+    await env.DB.prepare("UPDATE zones SET ssl_mode = 'off' WHERE id = 'z-pebble'").run();
+  });
+});
