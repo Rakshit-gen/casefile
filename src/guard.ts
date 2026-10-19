@@ -70,3 +70,16 @@ export function redact(text: string): { text: string; findings: Finding[] } {
   });
   return { text: out, findings };
 }
+
+const INJECTION: [string, RegExp][] = [
+  ["override instructions", /\b(?:ignore|disregard|forget)\b.{0,40}\b(?:instructions|rules|prompt|guidelines)\b/i],
+  ["role switch", /\b(?:you are now|from now on you|act as|pretend to be)\b/i],
+  ["prompt extraction", /\b(?:system prompt|your instructions|hidden instructions|developer message)\b/i],
+  ["chat template tokens", /<\|(?:im_start|im_end|system|endoftext)\|>|\[\/?INST\]|<\/?system>/i],
+  ["fake authority", /\b(?:admin override|authorized by (?:cloudflare|support|engineering)|this is (?:an? )?(?:system|support) (?:message|note))\b/i],
+  ["tool steering", /\b(?:call|use|run|invoke)\b.{0,20}\b(?:propose_change|set_ssl_mode|purge_cache|escalate|tool)\b/i],
+];
+
+export function injectionSignals(text: string): string[] {
+  return INJECTION.filter(([, re]) => re.test(text)).map(([name]) => name);
+}
