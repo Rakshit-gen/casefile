@@ -64,3 +64,39 @@ class VectorRecall implements Recall {
     }));
   }
 }
+
+const STOP = new Set("a an and are but can do does for from have how i in is it my of on or our so that the this to was we what when why with you your".split(" "));
+
+function terms(s: string): string[] {
+  return s.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 1 && !STOP.has(t));
+}
+
+class KeywordRecall implements Recall {
+  constructor(private db: D1Database) {}
+
+  async index(_c: Collection, docs: unknown[]): Promise<number> {
+    return docs.length; // reads straight from D1, nothing to build
+  }
+
+  async search(collection: Collection, query: string, k: number): Promise<Hit[]> {
+    const rows =
+      collection === "kb"
+        ? (await this.db.prepare("SELECT id, title, body AS text FROM kb_articles").all<{ id: string; title: string; text: string }>()).results
+        : (
+            await this.db
+              .prepare("SELECT id, subject AS title, summary AS text FROM cases WHERE status = 'resolved' AND summary IS NOT NULL ORDER BY resolved_at DESC LIMIT 500")
+              .all<{ id: string; title: string; text: string }>()
+          ).results;
+    const q = new Set(terms(query));
+    if (!q.size) return [];
+    return rows
+      .map((r) => {
+        const t = terms(`${r.title} ${r.title} ${r.text}`);
+        const hits = t.filter((w) => q.has(w)).length;
+        return { ...r, score: hits / Math.sqrt(t.length + 1) };
+      })
+      .filter((r) => r.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, k);
+  }
+}
