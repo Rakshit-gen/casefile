@@ -84,3 +84,24 @@ CREATE TABLE spans (
   PRIMARY KEY (trace_id, span_id)
 );
 CREATE INDEX spans_by_case ON spans (case_id, started_at);
+
+CREATE TABLE guardrail_events (
+  id INTEGER PRIMARY KEY,
+  case_id TEXT NOT NULL,
+  trace_id TEXT,
+  kind TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  at INTEGER NOT NULL
+);
+
+CREATE TABLE usage (
+  case_id TEXT NOT NULL,
+  trace_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  purpose TEXT NOT NULL CHECK (purpose IN ('agent', 'reviewer', 'embedding')),
+  input_tokens INTEGER NOT NULL,
+  output_tokens INTEGER NOT NULL,
+  cost_usd REAL NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (trace_id, purpose)
+);
