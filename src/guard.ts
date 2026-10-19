@@ -83,3 +83,10 @@ const INJECTION: [string, RegExp][] = [
 export function injectionSignals(text: string): string[] {
   return INJECTION.filter(([, re]) => re.test(text)).map(([name]) => name);
 }
+
+// Wraps content the model should read but never obey. The closing tag is
+// escaped inside the content so a document can't end the fence early.
+export function fence(source: string, content: string): string {
+  const safe = content.replace(/<\/?untrusted/gi, (m) => m.replace("<", "&lt;"));
+  return `<untrusted source="${source.replace(/"/g, "")}">\n${safe}\n</untrusted>`;
+}
