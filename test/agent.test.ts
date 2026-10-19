@@ -218,3 +218,50 @@ describe("guardrails", () => {
     expect(r.reply).toBe("Sure, I emailed [redacted email] the details.");
   });
 });
+
+describe("handing off", () => {
+  it("escalates with a summary for the engineer and delivers it through the queue", async () => {
+    install(
+      steps([
+        call("escalate", { reason: "refund request", summary: "Customer wants a refund for last month.", next_step: "billing review", priority: "normal" }),
+        say("A person from billing will take this."),
+      ]),
+    );
+    const r = await newCase("acct-quill", "I want a refund for last month", "refund");
+    expect(r.status).toBe("escalated");
+    const esc = await env.DB.prepare("SELECT summary, delivered_at FROM escalations WHERE case_id = ?").bind(r.caseId).first<{ summary: string }>();
+    expect(esc!.summary).toMatch(/refund for last month[\s\S]*billing review/);
+
+    // The agent stays quiet once a person owns the case.
+    const later = await env.CASE.getByName(r.caseId).message("hello?");
+    expect(later.reply).toBeNull();
+
+    // Deliver it the way the queue would, carrying the turn's trace.
+    const tp = `00-${r.traceId}-${"a".repeat(16)}-01`;
+    const batch = createMessageBatch("casefile-escalations", [{ id: "m1", timestamp: new Date(), attempts: 1, body: { caseId: r.caseId, priority: "normal" as const, summary: "s", traceparent: tp } }]);
+    const ctx = createExecutionContext();
+    await worker.queue(batch, env);
+    expect((await getQueueResult(batch, ctx)).explicitAcks).toEqual(["m1"]);
+    expect((await env.DB.prepare("SELECT delivery FROM escalations WHERE case_id = ?").bind(r.caseId).first())!.delivery).toBe("stored for the console");
+    const deliver = await env.DB.prepare("SELECT parent_id FROM spans WHERE trace_id = ? AND name = 'escalation.deliver'").bind(r.traceId).first();
+    expect(deliver!.parent_id).toBe("a".repeat(16));
+  });
+
+  it("escalates instead of failing when the model is down", async () => {
+    install(() => {
+      throw new Error("upstream 503");
+    });
+    const r = await newCase("acct-ferro", "api.ferro.example is down");
+    expect(r.status).toBe("escalated");
+    expect(r.reply).toMatch(/support engineer/);
+  });
+
+  it("sends every case to a person when the kill switch is off, without calling a model", async () => {
+    await env.FLAGS.put(FLAGS_KEY, JSON.stringify({ ...DEFAULT_FLAGS, enabled: false }));
+    const seen = install(steps([say("should not be called")]));
+    const r = await newCase("acct-ferro", "help");
+    expect(r.status).toBe("human_only");
+    expect(seen.agent).toHaveLength(0);
+    expect((await caseRow(r.caseId))!.agent_version).toBe("human");
+  });
+});
