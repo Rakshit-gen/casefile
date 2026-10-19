@@ -52,3 +52,23 @@ describe("fence", () => {
     expect(f).toContain("&lt;/untrusted>");
   });
 });
+
+describe("flags", () => {
+  it("falls back to defaults on a bad value and merges partial ones", async () => {
+    await env.FLAGS.put(FLAGS_KEY, JSON.stringify({ rolloutPercent: 250 }));
+    expect(await readFlags(env.FLAGS)).toEqual(DEFAULT_FLAGS);
+    await env.FLAGS.put(FLAGS_KEY, JSON.stringify({ promptVersion: "v1" }));
+    expect(await readFlags(env.FLAGS)).toEqual({ ...DEFAULT_FLAGS, promptVersion: "v1" });
+    await env.FLAGS.delete(FLAGS_KEY);
+  });
+
+  it("puts about the right share of accounts in a partial rollout, the same ones every time", () => {
+    const f = { ...DEFAULT_FLAGS, rolloutPercent: 25 };
+    const ids = Array.from({ length: 2000 }, (_, i) => `acct-${i}`);
+    const share = ids.filter((id) => inRollout(f, id)).length / ids.length;
+    expect(share).toBeGreaterThan(0.2);
+    expect(share).toBeLessThan(0.3);
+    expect(ids.filter((id) => inRollout(f, id))).toEqual(ids.filter((id) => inRollout(f, id)));
+    expect(inRollout({ ...f, enabled: false }, "acct-1")).toBe(false);
+  });
+});
