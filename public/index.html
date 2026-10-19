@@ -128,5 +128,268 @@
   <div class="right" id="detail"></div>
 </main>
 </div>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const ago = (t) => { const s = Math.max(0, (Date.now() - t) / 1000); return s < 60 ? `${s | 0}s ago` : s < 3600 ? `${(s / 60) | 0}m ago` : s < 86400 ? `${(s / 3600) | 0}h ago` : `${(s / 86400) | 0}d ago`; };
+const ms = (v) => v == null ? "–" : v < 1000 ? `${Math.round(v)}ms` : `${(v / 1000).toFixed(1)}s`;
+const pctf = (v) => v == null ? "–" : `${Math.round(v * 100)}%`;
+const statusText = (s) => ({ waiting_on_approval: "needs approval", human_only: "human only" })[s] || s.replace(/_/g, " ");
+const EMPTY_DETAIL = `<section><p class="empty">Pick a case to see its conversation, proposed changes and traces. Cases waiting on you are listed first.</p></section>`;
+const DEMOS = {
+  "acct-larder": ["Larder & Co: shop redirect loop", "Since we turned on HTTPS, shop.larder.example says ERR_TOO_MANY_REDIRECTS in every browser."],
+  "acct-quill": ["Quill Press: expired origin cert", "blog.quill.example shows Error 526 since yesterday. Can you just make it work?"],
+  "acct-ferro": ["Ferro Labs: origin down, 5xx", "api.ferro.example gives 522 errors for all requests. Is your network down?"],
+  "acct-pebble": ["Pebble: SSL off", "Browsers say pebble.example is not secure. How do I get the padlock?"],
+};
+const FILTERS = [["all", "All"], ["waiting_on_approval", "Needs approval"], ["escalated", "Escalated"], ["open", "Open"], ["resolved", "Resolved"]];
+
+let token = "", filter = "all", flashTimer, last = {};
+try { token = localStorage.getItem("casefile-token") || ""; } catch {}
+const fromHash = () => decodeURIComponent((location.hash.match(/^#c=(.+)$/) || [])[1] || "") || null;
+let selected = fromHash();
+const openTraces = new Set();
+
+function flash(text, bad = false) {
+  clearTimeout(flashTimer);
+  $("flash").textContent = text; $("flash").className = bad ? "bad" : "";
+  flashTimer = setTimeout(() => ($("flash").textContent = ""), 6000);
+}
+function changed(key, value) {
+  const s = JSON.stringify(value);
+  if (last[key] === s) return false;
+  last[key] = s; return true;
+}
+
+class Unauthorized extends Error {}
+async function api(path, init = {}) {
+  const r = await fetch(path, { ...init, headers: { "content-type": "application/json", authorization: `Bearer ${token}`, ...(init.headers || {}) } });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) throw new Unauthorized(j.error || "unauthorized");
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+// A button that changes something real needs a second click within 4 seconds,
+// when `needed` says so.
+function twoStep(el, confirmText, fn, needed = () => true) {
+  el.onclick = (e) => {
+    e.preventDefault();
+    if (!needed()) return fn();
+    if (!el.classList.contains("confirm")) {
+      const text = el.textContent;
+      el.classList.add("confirm"); el.textContent = confirmText;
+      setTimeout(() => { el.classList.remove("confirm"); el.textContent = text; }, 4000);
+      return;
+    }
+    el.classList.remove("confirm");
+    fn();
+  };
+}
+
+function showSignin(message = "") {
+  $("app").hidden = true; $("signout").hidden = true; $("signin").hidden = false;
+  $("auth-err").textContent = message; $("token").focus();
+}
+$("auth").onsubmit = async (e) => {
+  e.preventDefault();
+  token = $("token").value.trim();
+  try { await api("/api/flags"); } catch (err) { showSignin(err instanceof Unauthorized ? "That token was refused." : err.message); return; }
+  try { localStorage.setItem("casefile-token", token); } catch {}
+  $("token").value = "";
+  start();
+};
+$("signout").onclick = () => { token = ""; try { localStorage.removeItem("casefile-token"); } catch {} showSignin(); };
+
+$("d-account").innerHTML = Object.entries(DEMOS).map(([id, [name]]) => `<option value="${id}">${esc(name)}</option>`).join("");
+$("d-account").onchange = () => ($("d-text").value = DEMOS[$("d-account").value][1]);
+$("d-account").onchange();
+$("seed").onclick = async () => {
+  $("seed").disabled = true;
+  try { const r = await api("/api/seed", { method: "POST" }); flash(`Seeded the demo accounts and indexed ${r.articles} articles.`); } catch (e) { flash(e.message, true); }
+  $("seed").disabled = false;
+};
+$("demo").onsubmit = async (e) => {
+  e.preventDefault();
+  // Open the tab now: browsers block window.open after an await.
+  const tab = window.open("about:blank", "_blank");
+  $("d-open").disabled = true; $("d-open").textContent = "Waiting for the agent…";
+  try {
+    const text = $("d-text").value;
+    const r = await api("/api/demo/case", { method: "POST", body: JSON.stringify({ accountId: $("d-account").value, subject: text.slice(0, 80), description: text, channel: "chat" }) });
+    const url = `/chat#case=${encodeURIComponent(r.caseId)}&token=${encodeURIComponent(r.customerToken)}`;
+    if (tab) tab.location = url;
+    flash(tab ? `Opened ${r.caseId}. The customer's side is in the new tab.` : `Opened ${r.caseId}. Pop-ups are blocked; the customer link is ${location.origin}${url}`);
+    select(r.caseId);
+  } catch (err) { if (tab) tab.close(); flash(err.message, true); }
+  $("d-open").disabled = false; $("d-open").textContent = "Open as customer";
+};
+
+// Save stays disabled until something changes.
+document.querySelectorAll("#flags input, #flags select").forEach((el) => (el.oninput = () => ($("f-save").disabled = false)));
+function fillFlags(f) {
+  $("f-enabled").checked = f.enabled; $("f-rollout").value = f.rolloutPercent; $("f-prompt").value = f.promptVersion; $("f-auto").checked = f.autoApproveLowRisk;
+  $("f-model").textContent = `agent ${f.model} · reviewer ${f.reviewerModel} · up to ${f.maxSteps} steps a turn`;
+  $("f-save").disabled = true;
+}
+async function saveFlags() {
+  $("f-save").disabled = true;
+  try {
+    const f = await api("/api/flags", { method: "PUT", body: JSON.stringify({ enabled: $("f-enabled").checked, rolloutPercent: Number($("f-rollout").value), promptVersion: $("f-prompt").value, autoApproveLowRisk: $("f-auto").checked }) });
+    fillFlags(f);
+    flash(!f.enabled ? "Saved. The agent is off: new messages go straight to a person." : `Saved. ${$("f-rollout").value}% of accounts get the agent, prompt ${$("f-prompt").value}.`);
+  } catch (e) { flash(e.message, true); $("f-save").disabled = false; }
+}
+$("flags").onsubmit = (e) => e.preventDefault();
+twoStep($("f-save"), "Confirm: agent off", saveFlags, () => !$("f-enabled").checked);
+
+function renderMetrics(m) {
+  const g = Object.entries(m.guardrails).map(([k, v]) => `${v} ${k.replace(/_/g, " ")}`).join(", ") || "none";
+  const a = m.actions;
+  $("metrics").innerHTML = [
+    [m.cases.total, "cases, 7 days"],
+    [pctf(m.resolvedByAgent), "resolved by the agent"],
+    [pctf(m.escalationRate), "handed to a person"],
+    [`${ms(m.firstResponseMs.p50)} / ${ms(m.firstResponseMs.p95)}`, "first response p50 / p95"],
+    [`${ms(m.stepLatencyMs.p50)} / ${ms(m.stepLatencyMs.p95)}`, "model step p50 / p95"],
+    [m.costPerCaseUsd == null ? "–" : `$${m.costPerCaseUsd.toFixed(4)}`, "model cost per case"],
+    [`${a.awaiting_human || 0} waiting`, `${a.executed || 0} ran, ${a.denied || 0} denied by policy, ${a.rejected_by_reviewer || 0} by reviewer`],
+  ].map(([v, l]) => `<div class="metric"><b>${esc(v)}</b><span>${esc(l)}</span></div>`).join("") +
+    `<div class="metric" style="flex:1"><b style="font-size:13px;font-weight:400">${esc(g)}</b><span>guardrail events</span></div>`;
+  $("tools").innerHTML = m.tools.map((t) => `<tr><td>${esc(t.name.slice(5))}</td><td>${t.n}</td><td>${t.errors || 0}</td><td>${Math.round(t.avg_ms)}</td></tr>`).join("") || `<tr><td colspan="4" class="empty">No tool calls yet.</td></tr>`;
+}
+
+function renderCases(list) {
+  const count = (k) => k === "all" ? list.length : list.filter((c) => c.status === k || (k === "escalated" && c.status === "human_only")).length;
+  $("filters").innerHTML = FILTERS.map(([k, l]) => `<button aria-pressed="${filter === k}" data-f="${k}">${l} ${count(k) || ""}</button>`).join("");
+  document.querySelectorAll("[data-f]").forEach((b) => (b.onclick = () => { filter = b.dataset.f; last.cases = ""; renderCases(list); }));
+  const shown = list
+    .filter((c) => filter === "all" || c.status === filter || (filter === "escalated" && c.status === "human_only"))
+    .sort((a, b) => (b.awaiting > 0) - (a.awaiting > 0) || b.opened_at - a.opened_at);
+  $("n-cases").textContent = list.length || "";
+  $("cases").innerHTML = shown.map((c) => `<tr class="case ${c.id === selected ? "sel" : ""}" data-id="${esc(c.id)}" tabindex="0">
+    <td>${esc(c.id)}</td><td>${esc(c.account_name)}</td><td>${esc(c.subject)}</td>
+    <td class="st ${c.status}">${statusText(c.status)}${c.awaiting ? ` (${c.awaiting})` : ""}</td><td>${ago(c.opened_at)}</td></tr>`).join("")
+    || `<tr><td colspan="5" class="empty">${list.length ? "No cases match this filter." : "No cases yet. Seed the demo data, then open one above."}</td></tr>`;
+  document.querySelectorAll("tr.case").forEach((tr) => {
+    tr.onclick = () => select(tr.dataset.id);
+    tr.onkeydown = (e) => { if (e.key === "Enter") select(tr.dataset.id); };
+  });
+}
+
+function describe(a) {
+  const p = JSON.parse(a.params || "{}");
+  if (a.kind === "set_ssl_mode") return `Set SSL mode to <b>${esc(p.mode)}</b>`;
+  if (p.everything) return `Purge <b>everything</b> from the cache`;
+  return `Purge ${p.urls?.length ?? 0} URL${p.urls?.length === 1 ? "" : "s"}: <code>${esc((p.urls || []).join(", "))}</code>`;
+}
+
+function renderTraces(spans) {
+  const byTrace = new Map();
+  for (const s of spans) { if (!byTrace.has(s.trace_id)) byTrace.set(s.trace_id, []); byTrace.get(s.trace_id).push(s); }
+  const traces = [...byTrace.entries()].reverse();
+  return traces.map(([id, list], i) => {
+    const root = list.find((s) => !list.some((p) => p.span_id === s.parent_id)) || list[0];
+    const t0 = Math.min(...list.map((s) => s.started_at));
+    const total = Math.max(1, ...list.map((s) => s.started_at + s.duration_ms - t0));
+    const rows = list.slice().sort((a, b) => a.started_at - b.started_at || (a === root ? -1 : 1)).map((s) => {
+      const left = ((s.started_at - t0) / total) * 100, width = (s.duration_ms / total) * 100;
+      const extra = s.attrs.tool_calls ? ` → ${s.attrs.tool_calls}` : s.attrs.input ? ` ${s.attrs.input}` : "";
+      return `<div class="span ${s.status}" title="${esc(JSON.stringify(s.attrs, null, 1))}"><span class="name">${s === root ? "" : "· "}${esc((s.name + extra).slice(0, 90))}</span>
+        <span class="bar-wrap"><span class="bar" style="left:${left}%;width:${width}%"></span></span><span class="ms">${ms(s.duration_ms)}</span></div>`;
+    }).join("");
+    const tokens = root.attrs.input_tokens != null ? ` · ${root.attrs.input_tokens} in / ${root.attrs.output_tokens} out tokens` : "";
+    const errors = list.filter((s) => s.status === "error").length;
+    const open = openTraces.has(id) || (i === 0 && !openTraces.size);
+    return `<details class="trace" data-trace="${id}" ${open ? "open" : ""}><summary>${esc(root.name)} ${id.slice(0, 12)} · ${ago(t0)} · ${list.length} spans${errors ? `, <span class="err">${errors} failed</span>` : ""}${tokens}</summary>${rows}</details>`;
+  }).join("");
+}
+
+async function renderDetail() {
+  if (!selected) { if (changed("detail", null)) $("detail").innerHTML = EMPTY_DETAIL; return; }
+  let d;
+  try { d = await api(`/api/cases/${encodeURIComponent(selected)}`); } catch (e) {
+    if (e instanceof Unauthorized) throw e;
+    if (changed("detail", e.message)) $("detail").innerHTML = `<section><p class="err">${esc(e.message)}</p></section>`;
+    return;
+  }
+  if (!changed("detail", d)) return;
+  const c = d.case;
+  const cost = d.usage.reduce((a, u) => a + u.cost_usd, 0);
+  const waiting = d.actions.filter((a) => a.status === "awaiting_human");
+  $("detail").innerHTML = `
+    <section>
+      <h2>${esc(c.id)} · ${esc(c.account_name)} (${esc(c.plan)}) <span class="n">${esc(c.agent_version)}</span></h2>
+      <p class="mono" style="margin:0"><span class="st ${c.status}">${statusText(c.status)}</span> · opened ${ago(c.opened_at)} · first response ${c.first_response_at ? ms(c.first_response_at - c.opened_at) : "–"} · model cost $${cost.toFixed(5)}</p>
+      ${d.escalation ? `<div class="msg note" style="margin-top:10px"><span class="who">handoff (${esc(d.escalation.priority)}) · ${d.escalation.delivered_at ? `delivered, ${esc(d.escalation.delivery)}` : "queued"}</span>${esc(d.escalation.summary)}</div>` : ""}
+    </section>
+    <section>
+      <h2>Proposed changes <span class="n">${waiting.length ? `${waiting.length} waiting on you` : d.actions.length || ""}</span></h2>
+      ${d.actions.map((a) => `<div class="action ${a.status === "awaiting_human" ? "waiting" : ""}">
+        <div class="row">${describe(a)} on <code>${esc(a.zone_id)}</code> · ${esc(a.risk)} risk · <span class="st">${esc(a.status.replace(/_/g, " "))}</span></div>
+        <div class="empty" style="font-size:12.5px">${esc(a.rationale)}</div>
+        <ol>${a.gate_notes.map((n) => `<li>${esc(n)}</li>`).join("")}${a.decided_by ? `<li>${esc(a.status)} by ${esc(a.decided_by)}${a.result ? `: ${esc(a.result)}` : ""}</li>` : ""}</ol>
+        ${a.status === "awaiting_human" ? `<div class="row"><button class="primary" data-a="${esc(a.id)}" data-yes="1">Approve and run</button><button data-a="${esc(a.id)}" data-yes="">Reject</button></div>
+          <p class="hint">Rejecting hands the case to a person. Unanswered approvals expire and escalate.</p>` : ""}
+      </div>`).join("") || `<p class="empty">None.</p>`}
+    </section>
+    <section>
+      <h2>Conversation <span class="n">${d.transcript.length}</span></h2>
+      ${d.transcript.map((m) => `<div class="msg ${m.role}"><span class="who">${m.role === "note" ? "internal note" : m.role} · ${ago(m.at)}</span>${esc(m.content)}</div>`).join("") || `<p class="empty">No messages.</p>`}
+    </section>
+    <section>
+      <h2>Guardrails <span class="n">${d.guardrails.length || ""}</span></h2>
+      ${d.guardrails.length ? `<div class="scroll"><table>${d.guardrails.map((g) => `<tr><td>${esc(g.kind.replace(/_/g, " "))}</td><td>${esc(g.detail)}</td><td>${ago(g.at)}</td></tr>`).join("")}</table></div>` : `<p class="empty">Nothing tripped.</p>`}
+    </section>
+    <section>
+      <h2>Traces <span class="n">hover a span for its attributes</span></h2>${renderTraces(d.spans) || `<p class="empty">None yet.</p>`}
+    </section>`;
+  document.querySelectorAll("details.trace").forEach((el) => (el.ontoggle = () => (el.open ? openTraces.add(el.dataset.trace) : openTraces.delete(el.dataset.trace))));
+  document.querySelectorAll("[data-a]").forEach((b) => {
+    const decide = async () => {
+      b.disabled = true;
+      try {
+        const r = await api(`/api/actions/${b.dataset.a}/decision`, { method: "POST", body: JSON.stringify({ approved: !!b.dataset.yes, by: "console" }) });
+        flash(b.dataset.yes ? `Approved and ran: ${r.result || r.status}.` : "Rejected. The case went to a person.");
+      } catch (e) { flash(e.message, true); b.disabled = false; }
+      tick(true);
+    };
+    if (b.dataset.yes) twoStep(b, "Confirm: run it now", decide); else b.onclick = decide;
+  });
+}
+
+function select(id) {
+  history.replaceState(null, "", id ? `#c=${encodeURIComponent(id)}` : location.pathname);
+  selected = id; openTraces.clear(); last.detail = ""; last.cases = "";
+  tick(true);
+  if (id && innerWidth < 1000) $("detail").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+addEventListener("hashchange", () => fromHash() !== selected && select(fromHash()));
+addEventListener("keydown", (e) => { if (e.key === "Escape" && selected && !e.target.closest("input, select, textarea")) select(null); });
+
+async function tick(force = false) {
+  if (!token || (document.hidden && !force)) return;
+  try {
+    const [m, list] = await Promise.all([api("/api/metrics"), api("/api/cases")]);
+    $("conn").textContent = ""; $("conn").className = "empty";
+    if (changed("metrics", m)) renderMetrics(m);
+    if (changed("cases", list)) renderCases(list);
+    await renderDetail();
+  } catch (e) {
+    if (e instanceof Unauthorized) { showSignin("The token was refused. It may have changed."); return; }
+    $("conn").textContent = `can't reach the API (${e.message}), retrying`; $("conn").className = "bad";
+  }
+}
+
+async function start() {
+  $("signin").hidden = true; $("app").hidden = false; $("signout").hidden = false;
+  last = {};
+  try { fillFlags(await api("/api/flags")); } catch (e) { if (e instanceof Unauthorized) return showSignin("The token was refused."); }
+  tick(true);
+}
+setInterval(tick, 4000);
+document.addEventListener("visibilitychange", () => tick());
+if (token) start(); else showSignin();
+</script>
 </body>
 </html>
